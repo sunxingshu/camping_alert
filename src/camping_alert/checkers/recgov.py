@@ -10,6 +10,7 @@ when a Fri+Sat pair straddles a month boundary.
 """
 
 import logging
+import time
 from datetime import date, timedelta
 from typing import Any
 
@@ -49,7 +50,13 @@ def _fetch_month(campground_id: str, month_start: date) -> dict[str, Any]:
         f"{_BASE}/{campground_id}/month"
         f"?start_date={month_start.strftime('%Y-%m-01')}T00%3A00%3A00.000Z"
     )
+    time.sleep(1.5)  # polite ~40 req/min cap across all RecGov campgrounds
     resp = httpx.get(url, headers=_HEADERS, timeout=20)
+    if resp.status_code == 429:
+        retry_after = int(resp.headers.get("Retry-After", "60"))
+        log.warning("RecGov 429 — sleeping %ds before retry", retry_after)
+        time.sleep(retry_after)
+        resp.raise_for_status()
     resp.raise_for_status()
     return resp.json()
 
