@@ -39,9 +39,9 @@ jobs:
 
       - name: Run availability check
         env:
-          ALERT_FROM_EMAIL: ${{ secrets.ALERT_FROM_EMAIL }}
-          ALERT_FROM_PASSWORD: ${{ secrets.ALERT_FROM_PASSWORD }}
-          ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+          ALERT_FROM_EMAIL: ${{ secrets.GMAIL_USER }}
+          ALERT_FROM_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_TO_EMAIL: sunxingshu@gmail.com
           LOOKAHEAD_WEEKS_MIN: "2"
           LOOKAHEAD_WEEKS_MAX: "12"
           MIN_SITE_LENGTH_FT: "25"
