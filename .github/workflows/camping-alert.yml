@@ -25,7 +25,9 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e .
+        run: |
+          pip install -e .
+          playwright install chromium --with-deps
 
       # Restore the seen-slots DB from the most recent successful run.
       # Cache key rotates each run so the updated DB is always saved.
