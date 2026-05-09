@@ -1,26 +1,19 @@
 """
 ReserveCalifornia checker — Playwright-based.
 
-The old calirdr.usedirect.com API is decommissioned (DNS → 0.0.0.0).
-The current reservecalifornia.com site sits behind Cloudflare, so plain
-HTTP requests get 403. We use a headless Chromium browser via Playwright
-which passes the JS challenge and lets us intercept the real XHR calls
-the frontend makes to its internal booking API.
-
-Strategy:
-  1. Open the park's availability page in a headless browser.
-  2. Intercept every XHR/fetch response whose URL contains "availability"
-     or "grid" — that's the payload the calendar renders from.
-  3. Parse it for unit-level slot availability.
-  4. Fall back to scraping the rendered DOM calendar if the XHR approach
-     yields nothing for a given park.
+The old calirdr.usedirect.com API is decommissioned. The current
+reservecalifornia.com site is behind Cloudflare, blocking plain HTTP.
+We use a headless Chromium browser that:
+  1. Navigates to the park's availability page (passes JS challenge).
+  2. Fills in the check-in date + 2 nights in the search form.
+  3. Waits for the calendar XHR to fire and intercepts the JSON payload.
+  4. Parses the payload for per-unit availability.
 """
 
 import json
 import logging
 import time
 from datetime import date, timedelta
-from typing import Any
 
 from ..campgrounds import Campground, HookupType
 from ..config import Config
@@ -29,11 +22,13 @@ from .base import friday_saturday_pairs
 
 log = logging.getLogger(__name__)
 
-# Known working park URL template on reservecalifornia.com
-_PARK_URL = "https://www.reservecalifornia.com/Web/#!park/{park_id}"
+_BASE_URL = "https://www.reservecalifornia.com/Web/#!park/{park_id}"
 
-# API response URL fragments we want to capture
-_API_PATTERNS = ("availability", "grid", "unitavail", "UnitAvail", "Availab")
+# URL fragments that identify the availability XHR payload
+_XHR_PATTERNS = (
+    "grid", "availability", "UnitAvail", "unitavail",
+    "SearchViewUnit", "Availab",
+)
 
 _HOOKUP_KEYWORDS: dict[str, HookupType] = {
     "full hookup": HookupType.FULL,
@@ -54,29 +49,23 @@ def _infer_hookup(text: str) -> HookupType:
     return HookupType.NONE
 
 
-def _parse_api_response(payload: dict, campground: Campground,
-                        friday: date, sunday: date) -> list[AvailableSlot]:
-    """Try to extract AvailableSlot objects from a captured XHR payload."""
+def _parse_payload(payload: dict, campground: Campground,
+                   friday: date, sunday: date) -> list[AvailableSlot]:
     results: list[AvailableSlot] = []
     saturday = friday + timedelta(days=1)
     fri_str = friday.strftime("%-m/%-d/%Y")
     sat_str = saturday.strftime("%-m/%-d/%Y")
 
-    # The UseDirect / ActiveNetwork payload nests units under Facility.Units
     facility = payload.get("Facility") or {}
     units: dict = facility.get("Units") or {}
 
     for unit_id, unit in units.items():
         slices: dict = unit.get("Slices") or {}
-        fri_slice = slices.get(fri_str) or {}
-        sat_slice = slices.get(sat_str) or {}
+        fri_s = slices.get(fri_str) or {}
+        sat_s = slices.get(sat_str) or {}
 
-        fri_ok = fri_slice.get("IsFree") or (fri_slice.get("Status") or "").lower() in (
-            "available", "open", "a"
-        )
-        sat_ok = sat_slice.get("IsFree") or (sat_slice.get("Status") or "").lower() in (
-            "available", "open", "a"
-        )
+        fri_ok = fri_s.get("IsFree") or (fri_s.get("Status") or "").lower() in ("available", "open", "a")
+        sat_ok = sat_s.get("IsFree") or (sat_s.get("Status") or "").lower() in ("available", "open", "a")
         if not (fri_ok and sat_ok):
             continue
 
@@ -90,17 +79,17 @@ def _parse_api_response(payload: dict, campground: Campground,
             except (TypeError, ValueError):
                 pass
 
-        name_text = (unit.get("Name") or unit_id).lower()
+        site_name = unit.get("Name") or str(unit_id)
         is_pull: bool | None = (
-            True if "pull" in name_text else
-            False if "back" in name_text else
-            None
+            True if "pull" in site_name.lower()
+            else False if "back" in site_name.lower()
+            else None
         )
 
         results.append(AvailableSlot(
             campground=campground,
             site_id=str(unit_id),
-            site_name=unit.get("Name") or str(unit_id),
+            site_name=site_name,
             checkin=friday,
             checkout=sunday,
             hookup_type=hookup,
@@ -116,15 +105,20 @@ def _parse_api_response(payload: dict, campground: Campground,
     return results
 
 
-def _check_one_date_playwright(campground: Campground, friday: date,
-                               sunday: date) -> list[AvailableSlot]:
-    """Load the park availability page for one Fri+Sat pair, intercept XHR."""
-    from playwright.sync_api import sync_playwright
+def _check_one_park_all_dates(
+    campground: Campground,
+    pairs: list[tuple[date, date]],
+) -> list[AvailableSlot]:
+    """
+    Open the park page once, fill in each Fri+Sat pair, capture the XHR.
+    Reuses the same browser session to avoid re-loading/re-challenging Cloudflare.
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-    captured_payloads: list[dict] = []
+    results: list[AvailableSlot] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -132,49 +126,118 @@ def _check_one_date_playwright(campground: Campground, friday: date,
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             locale="en-US",
+            viewport={"width": 1280, "height": 900},
         )
         page = ctx.new_page()
 
-        def _on_response(response):
-            url = response.url
-            if any(pat in url for pat in _API_PATTERNS):
-                try:
-                    body = response.json()
-                    if isinstance(body, dict) and ("Facility" in body or "Units" in body):
-                        captured_payloads.append(body)
-                        log.debug("Captured ReserveCalifornia XHR: %s", url)
-                except Exception:
-                    pass
-
-        page.on("response", _on_response)
-
-        url = _PARK_URL.format(park_id=campground.platform_id)
+        # Initial park page load
+        url = _BASE_URL.format(park_id=campground.platform_id)
+        log.debug("Loading %s", url)
         try:
             page.goto(url, wait_until="networkidle", timeout=45_000)
-        except Exception as exc:
-            log.warning("ReserveCalifornia page load timeout for %s: %s", campground.name, exc)
+        except PWTimeout:
+            log.warning("Timeout loading %s — continuing anyway", url)
+        time.sleep(2)
 
-        # Try clicking into the availability calendar for this date
-        try:
-            # Look for a date picker or "Check Availability" button
-            check_btn = page.locator(
-                "button:has-text('Check Availability'), "
-                "button:has-text('Search'), "
-                "a:has-text('Check Availability')"
-            ).first
-            if check_btn.is_visible(timeout=5_000):
-                check_btn.click()
-                page.wait_for_load_state("networkidle", timeout=20_000)
-        except Exception:
-            pass
+        for friday, sunday in pairs:
+            saturday = friday + timedelta(days=1)
+            captured: list[dict] = []
 
-        time.sleep(3)  # let any deferred XHR settle
+            def _capture(response):
+                url_r = response.url
+                if any(p in url_r for p in _XHR_PATTERNS):
+                    try:
+                        body = response.json()
+                        if isinstance(body, dict) and "Facility" in body:
+                            captured.append(body)
+                    except Exception:
+                        pass
+
+            page.on("response", _capture)
+
+            # Try filling the arrival date — attempt several selector patterns
+            checkin_str = friday.strftime("%m/%d/%Y")  # MM/DD/YYYY format
+            filled = False
+            for sel in [
+                "input[placeholder*='rrival']",      # Arrival date
+                "input[placeholder*='heck']",         # Check-in
+                "input[placeholder*='tart']",         # Start date
+                "input[ng-model*='arrival']",
+                "input[ng-model*='ArrivalDate']",
+                "input[id*='arrival']",
+                "input[id*='Arrival']",
+                "#ArrivalDate",
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=2_000):
+                        loc.triple_click()
+                        loc.fill(checkin_str)
+                        loc.press("Tab")
+                        filled = True
+                        log.debug("Filled arrival via selector: %s", sel)
+                        break
+                except Exception:
+                    continue
+
+            if not filled:
+                log.debug("Could not find arrival date input for %s", campground.name)
+
+            # Set nights to 2 if possible
+            for sel in [
+                "select[ng-model*='nights']",
+                "select[ng-model*='Nights']",
+                "input[ng-model*='nights']",
+                "#Nights", "#nights",
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=1_500):
+                        loc.select_option("2") if loc.evaluate("e => e.tagName") == "SELECT" else loc.fill("2")
+                        break
+                except Exception:
+                    continue
+
+            # Click search / check availability button
+            for sel in [
+                "button:has-text('Search')",
+                "button:has-text('Check Availability')",
+                "button:has-text('Find')",
+                "input[type='submit']",
+                "a:has-text('Search')",
+            ]:
+                try:
+                    btn = page.locator(sel).first
+                    if btn.is_visible(timeout=1_500):
+                        btn.click()
+                        log.debug("Clicked search button: %s", sel)
+                        break
+                except Exception:
+                    continue
+
+            # Wait for XHR to settle
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except PWTimeout:
+                pass
+            time.sleep(2)
+
+            page.remove_listener("response", _capture)
+
+            if captured:
+                log.debug("Captured %d XHR payload(s) for %s %s",
+                          len(captured), campground.name, friday)
+                for payload in captured:
+                    results.extend(_parse_payload(payload, campground, friday, sunday))
+            else:
+                log.debug("No availability XHR captured for %s %s — site may be fully booked",
+                          campground.name, friday)
+
+            time.sleep(2)  # polite gap between searches
+
         ctx.close()
         browser.close()
 
-    results: list[AvailableSlot] = []
-    for payload in captured_payloads:
-        results.extend(_parse_api_response(payload, campground, friday, sunday))
     return results
 
 
@@ -183,15 +246,10 @@ def check(campground: Campground, cfg: Config) -> list[AvailableSlot]:
     if not pairs:
         return []
 
-    results: list[AvailableSlot] = []
-    for friday, sunday in pairs:
-        try:
-            slots = _check_one_date_playwright(campground, friday, sunday)
-            results.extend(slots)
-            log.info("ReserveCalifornia %s %s: %d slots", campground.name, friday, len(slots))
-        except Exception as exc:
-            log.warning("ReserveCalifornia Playwright check failed for %s on %s: %s",
-                        campground.name, friday, exc)
-        time.sleep(3)  # polite gap between park requests
-
-    return results
+    try:
+        results = _check_one_park_all_dates(campground, pairs)
+        log.info("ReserveCalifornia %s: %d total slots found", campground.name, len(results))
+        return results
+    except Exception as exc:
+        log.error("ReserveCalifornia Playwright failed for %s: %s", campground.name, exc)
+        return []

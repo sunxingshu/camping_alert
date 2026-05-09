@@ -44,8 +44,8 @@ jobs:
           ALERT_FROM_EMAIL: ${{ secrets.GMAIL_USER }}
           ALERT_FROM_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ALERT_TO_EMAIL: sunxingshu@gmail.com
-          LOOKAHEAD_WEEKS_MIN: "2"
-          LOOKAHEAD_WEEKS_MAX: "12"
+          LOOKAHEAD_WEEKS_MIN: "1"
+          LOOKAHEAD_WEEKS_MAX: "24"
           MIN_SITE_LENGTH_FT: "25"
           REQUIRE_HOOKUP: "true"
           REQUIRE_DUMP_STATION: "true"
