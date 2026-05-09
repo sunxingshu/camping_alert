@@ -136,21 +136,66 @@ def _interval_minutes(cfg) -> int:
     return cfg.check_interval_minutes
 
 
+def _run_test(cfg) -> None:
+    """Send one fake alert email to verify credentials and SMTP pipeline."""
+    from datetime import date, timedelta
+    from .campgrounds import Campground, HookupType, Platform
+    from .matcher import AvailableSlot
+
+    log.info("TEST MODE — sending test email to %s", cfg.alert_to_email)
+
+    friday = date.today() + timedelta((4 - date.today().weekday()) % 7 or 7)
+    fake_cg = Campground(
+        name="Doran Regional Park — Site 42 (TEST)",
+        park_name="Doran Regional Park",
+        city="Bodega Bay, CA",
+        platform=Platform.RESERVECA,
+        platform_id="1177",
+        booking_url="https://www.reservecalifornia.com/Web/#!park/1177",
+        drive_minutes=115,
+        ocean_view=True,
+        hookup_type=HookupType.FULL,
+        has_dump_station=True,
+        has_pull_through=True,
+        notes="THIS IS A TEST EMAIL — not a real availability alert.",
+    )
+    fake_slot = AvailableSlot(
+        campground=fake_cg,
+        site_id="TEST-42",
+        site_name="Site 42 — Pull-Through (TEST)",
+        checkin=friday,
+        checkout=friday + timedelta(days=2),
+        hookup_type=HookupType.FULL,
+        has_dump_station=True,
+        site_length_ft=45,
+        is_pull_through=True,
+        booking_url="https://www.reservecalifornia.com/Web/#!park/1177",
+    )
+
+    send_alert(fake_slot, cfg)
+    log.info("Test email sent successfully.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Coastal camping availability alert")
     parser.add_argument("--once", action="store_true",
                         help="Run a single check then exit")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Find slots but do not send emails or write to DB")
+    parser.add_argument("--test", action="store_true",
+                        help="Send a test email to verify credentials, then exit (no scan)")
     args = parser.parse_args()
 
     cfg = cfg_module.load()
-    db = SlotDB()
 
     log.info("Camping alert started. Email alerts -> %s", cfg.alert_to_email)
     log.info("Look-ahead: %d–%d weeks | Check interval: %d min (peak: %d min)",
              cfg.lookahead_weeks_min, cfg.lookahead_weeks_max,
              cfg.check_interval_minutes, cfg.peak_interval_minutes)
+
+    if args.test:
+        _run_test(cfg)
+        return
+
+    db = SlotDB()
 
     if args.once:
         run_check(cfg, db)
