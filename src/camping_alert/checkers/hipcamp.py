@@ -136,23 +136,29 @@ def _slot_from_listing(listing: dict, friday: date, sunday: date) -> AvailableSl
 
 def _extract_listings(payload: dict) -> list[dict]:
     """Pull a flat list of listing dicts from any known Hipcamp response shape."""
+    # Use `or {}` so that explicitly-null keys don't crash the chained .get()
+    page_props = payload.get("pageProps") or {}
+    data_block = payload.get("data") or {}
+    search_data = page_props.get("searchData") or {}
     candidates = [
         # Next.js _next/data shape
-        payload.get("pageProps", {}).get("initialListings"),
-        payload.get("pageProps", {}).get("listings"),
-        payload.get("pageProps", {}).get("searchResults"),
+        page_props.get("initialListings"),
+        page_props.get("listings"),
+        page_props.get("searchResults"),
+        search_data.get("listings"),
         # Direct REST shape
         payload.get("campsite_listings"),
         payload.get("listings"),
         payload.get("results"),
         # GraphQL shape
-        payload.get("data", {}).get("listings"),
-        payload.get("data", {}).get("searchListings"),
-        payload.get("data", {}).get("campsiteListings"),
+        data_block.get("listings"),
+        data_block.get("searchListings"),
+        data_block.get("campsiteListings"),
     ]
     for lst in candidates:
         if isinstance(lst, list) and lst:
-            return lst
+            # Filter out any null/non-dict items that sneak in
+            return [item for item in lst if isinstance(item, dict)]
     return []
 
 

@@ -1,20 +1,19 @@
 """
 ReserveCalifornia checker — curl_cffi TLS impersonation.
 
-Cloudflare Bot Management blocks headless Playwright browsers (empty page,
-0 XHR captured on GitHub Actions). curl_cffi impersonates Chrome's TLS
-fingerprint at the network level, which bypasses Cloudflare's bot detection
-without requiring JS execution.
+Cloudflare Bot Management blocked headless Playwright. curl_cffi impersonates
+Chrome's TLS fingerprint, bypassing bot detection without JS execution.
 
-Availability endpoint discovered from the reservecalifornia.com AngularJS app:
-  GET /CaliforniaWebHome/Facilities/SearchViewUnitAvailabity.aspx
-      ?facility_id=677&start_date=05/16/2025&nights=2&...
+The old ASPX endpoint is gone. We discover the live API base URL from the
+SPA's configuration file (assets/env.json or similar), then query the
+availability endpoint directly.
 
 Set CAMPING_DEBUG=1 to log HTTP status codes and response previews.
 """
 
 import logging
 import os
+import re
 from datetime import date, timedelta
 
 from ..campgrounds import Campground, HookupType
@@ -26,12 +25,6 @@ log = logging.getLogger(__name__)
 DEBUG = os.getenv("CAMPING_DEBUG", "").lower() in ("1", "true", "yes")
 
 _BASE = "https://www.reservecalifornia.com"
-
-# Candidate availability endpoints, tried in order.
-_AVAIL_ENDPOINTS = [
-    f"{_BASE}/CaliforniaWebHome/Facilities/SearchViewUnitAvailabity.aspx",
-    f"{_BASE}/CaliforniaWebHome/Facilities/AdvanceSearchResults.aspx",
-]
 
 _HOOKUP_KEYWORDS: dict[str, HookupType] = {
     "full hookup": HookupType.FULL,
@@ -110,12 +103,77 @@ def _parse_payload(payload: dict, campground: Campground,
             site_length_ft=length,
             is_pull_through=is_pull,
             booking_url=(
-                f"https://www.reservecalifornia.com/Web/#!park/"
+                f"{_BASE}/Web/#!park/"
                 f"{campground.platform_id}/unit/{unit_id}"
             ),
         ))
 
     return results
+
+
+def _discover_api_base(session) -> str | None:
+    """
+    Try to discover the API base URL from SPA config files and HTML.
+    Angular SPAs commonly expose /assets/env.json or /config.json with the
+    API base URL, or embed it in inline <script> tags.
+    """
+    # Common SPA config file paths
+    for path in ("/assets/env.json", "/config.json", "/app-config.json",
+                 "/assets/config.json", "/environment.json"):
+        try:
+            r = session.get(_BASE + path, timeout=10)
+            if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
+                data = r.json()
+                if isinstance(data, dict):
+                    for key in ("apiUrl", "apiBaseUrl", "baseUrl", "api_url",
+                                "API_URL", "serviceUrl", "webApiUrl"):
+                        val = data.get(key)
+                        if val and isinstance(val, str):
+                            log.info("ReserveCalifornia: API base found in %s: %s", path, val)
+                            return val.rstrip("/")
+        except Exception:
+            pass
+
+    # Scan main page HTML for inline config / API URL hints
+    try:
+        r = session.get(_BASE + "/", timeout=20)
+        if r.status_code == 200:
+            for pattern in (
+                r'(?:apiUrl|apiBaseUrl|baseUrl|serviceUrl)\s*[=:]\s*["\']([^"\']{10,120})["\']',
+                r'https?://[a-zA-Z0-9._-]+(?:reservecalifornia|usedirect)[a-zA-Z0-9._/-]*/api[a-zA-Z0-9._/-]*',
+            ):
+                matches = re.findall(pattern, r.text, re.I)
+                if matches:
+                    url = matches[0].rstrip("/")
+                    log.info("ReserveCalifornia: API base found in page HTML: %s", url)
+                    return url
+    except Exception:
+        pass
+
+    return None
+
+
+def _availability_endpoints(api_base: str | None, facility_id: str) -> list[tuple[str, dict]]:
+    """
+    Return a list of (url, params) pairs to try for availability.
+    Ordered by likelihood of success on the current platform.
+    """
+    endpoints = []
+
+    if api_base:
+        endpoints += [
+            (f"{api_base}/Facilities/SearchViewUnitAvailabity", {}),
+            (f"{api_base}/availability/campground/{facility_id}", {}),
+        ]
+
+    # Classic Active Network ASPX endpoint (may still work on some deployments)
+    endpoints += [
+        (f"{_BASE}/CaliforniaWebHome/Facilities/SearchViewUnitAvailabity.aspx", {}),
+        (f"{_BASE}/api/Facilities/SearchViewUnitAvailabity", {}),
+        (f"{_BASE}/api/availability/campground/{facility_id}", {}),
+    ]
+
+    return endpoints
 
 
 def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> list[AvailableSlot]:
@@ -125,13 +183,21 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
     results: list[AvailableSlot] = []
     park_url = f"{_BASE}/Web/#!park/{campground.platform_id}"
 
-    # Load the park page first to establish Cloudflare clearance cookies.
+    # Load the park page to establish Cloudflare clearance cookies.
     try:
         r = session.get(park_url, timeout=25)
         if DEBUG:
-            log.info("[DEBUG ReserveCA] base page %s -> HTTP %s", campground.platform_id, r.status_code)
+            log.info("[DEBUG ReserveCA] park page %s -> HTTP %s (len %d)",
+                     campground.platform_id, r.status_code, len(r.text))
     except Exception as exc:
         log.warning("ReserveCalifornia base page failed for %s: %s", campground.name, exc)
+
+    # Try to learn the real API base URL from SPA config/HTML
+    api_base = _discover_api_base(session)
+    if DEBUG:
+        log.info("[DEBUG ReserveCA] discovered api_base: %s", api_base)
+
+    endpoints = _availability_endpoints(api_base, campground.platform_id)
 
     api_headers = {
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -145,7 +211,7 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
         checkin_str = friday.strftime("%m/%d/%Y")
         found_for_pair = False
 
-        for endpoint in _AVAIL_ENDPOINTS:
+        for url, extra_params in endpoints:
             if found_for_pair:
                 break
             params = {
@@ -156,15 +222,17 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
                 "web_only": "true",
                 "is_ada": "false",
                 "in_season_only": "true",
+                **extra_params,
             }
             try:
-                resp = session.get(endpoint, params=params, headers=api_headers, timeout=25)
+                resp = session.get(url, params=params, headers=api_headers, timeout=25)
+                ct = resp.headers.get("content-type", "")
                 if DEBUG:
-                    log.info("[DEBUG ReserveCA] %s %s -> HTTP %s",
-                             campground.platform_id, friday, resp.status_code)
-                if resp.status_code != 200:
-                    if DEBUG:
-                        log.info("[DEBUG ReserveCA] body preview: %s", resp.text[:300])
+                    log.info("[DEBUG ReserveCA] %s %s -> HTTP %s ct=%s",
+                             campground.platform_id, friday, resp.status_code, ct[:40])
+                if resp.status_code != 200 or "json" not in ct:
+                    if DEBUG and resp.status_code != 200:
+                        log.info("[DEBUG ReserveCA] body preview: %s", resp.text[:200])
                     continue
                 body = resp.json()
                 if _looks_like_availability(body):
@@ -172,14 +240,14 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
                     results.extend(slots)
                     found_for_pair = True
                     if DEBUG:
-                        log.info("[DEBUG ReserveCA] %s %s: %d slots parsed from %s",
-                                 campground.platform_id, friday, len(slots), endpoint)
+                        log.info("[DEBUG ReserveCA] %s %s: %d slots from %s",
+                                 campground.platform_id, friday, len(slots), url)
                 elif DEBUG:
-                    log.info("[DEBUG ReserveCA] response not availability shape: %s",
+                    log.info("[DEBUG ReserveCA] JSON but not availability shape: %s",
                              str(body)[:200])
             except Exception as exc:
-                log.debug("ReserveCalifornia endpoint %s failed for %s: %s",
-                          endpoint, campground.name, exc)
+                log.debug("ReserveCalifornia %s failed for %s %s: %s",
+                          url, campground.name, friday, exc)
 
     # Deduplicate
     seen: set[str] = set()
