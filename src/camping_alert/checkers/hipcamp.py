@@ -21,6 +21,7 @@ from .base import friday_saturday_pairs
 
 log = logging.getLogger(__name__)
 DEBUG = os.getenv("CAMPING_DEBUG", "").lower() in ("1", "true", "yes")
+_EXECUTABLE = os.getenv("PLAYWRIGHT_EXECUTABLE_PATH") or None
 
 _SEARCH_URL = (
     "https://www.hipcamp.com/en-US/search"
@@ -163,13 +164,14 @@ def check_hipcamp(cfg: Config) -> list[AvailableSlot]:
     seen_ids: set[str] = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
+        launch_kwargs: dict = dict(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled",
+                  "--ignore-certificate-errors"],
         )
+        if _EXECUTABLE:
+            launch_kwargs["executable_path"] = _EXECUTABLE
+        browser = p.chromium.launch(**launch_kwargs)
         ctx = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -178,8 +180,8 @@ def check_hipcamp(cfg: Config) -> list[AvailableSlot]:
             ),
             locale="en-US",
             viewport={"width": 1280, "height": 900},
+            ignore_https_errors=True,
         )
-        # Hide webdriver flag
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page = ctx.new_page()
 

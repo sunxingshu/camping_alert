@@ -22,6 +22,7 @@ from .base import friday_saturday_pairs
 
 log = logging.getLogger(__name__)
 DEBUG = os.getenv("CAMPING_DEBUG", "").lower() in ("1", "true", "yes")
+_EXECUTABLE = os.getenv("PLAYWRIGHT_EXECUTABLE_PATH") or None
 
 _BASE_URL = "https://www.reservecalifornia.com/Web/#!park/{park_id}"
 
@@ -117,13 +118,14 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
     results: list[AvailableSlot] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
+        launch_kwargs: dict = dict(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled",
+                  "--ignore-certificate-errors"],
         )
+        if _EXECUTABLE:
+            launch_kwargs["executable_path"] = _EXECUTABLE
+        browser = p.chromium.launch(**launch_kwargs)
         ctx = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -132,8 +134,8 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
             ),
             locale="en-US",
             viewport={"width": 1280, "height": 900},
+            ignore_https_errors=True,
         )
-        # Hide automation flag — some Cloudflare configs check navigator.webdriver
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page = ctx.new_page()
 
