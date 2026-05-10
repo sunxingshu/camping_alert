@@ -117,7 +117,13 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
     results: list[AvailableSlot] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         ctx = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -127,6 +133,8 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
             locale="en-US",
             viewport={"width": 1280, "height": 900},
         )
+        # Hide automation flag — some Cloudflare configs check navigator.webdriver
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page = ctx.new_page()
 
         # ── Capture ALL JSON XHR/fetch responses ──────────────────────────────
@@ -156,8 +164,21 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
             log.warning("Timeout loading park page for %s", campground.name)
 
         if DEBUG:
-            log.info("[DEBUG] Page title: %s", page.title())
+            log.info("[DEBUG] Page title: %r", page.title())
             log.info("[DEBUG] Page URL: %s", page.url)
+            # Save screenshot so we can see what Cloudflare/the site actually renders
+            try:
+                shot_path = f"/tmp/reserveca_debug_{campground.platform_id}.png"
+                page.screenshot(path=shot_path, full_page=False)
+                log.info("[DEBUG] Screenshot saved: %s", shot_path)
+            except Exception as ex:
+                log.info("[DEBUG] Screenshot failed: %s", ex)
+            # Log first 500 chars of page content
+            try:
+                content_preview = page.content()[:500].replace("\n", " ")
+                log.info("[DEBUG] Page content preview: %s", content_preview)
+            except Exception:
+                pass
 
         time.sleep(2)
 
