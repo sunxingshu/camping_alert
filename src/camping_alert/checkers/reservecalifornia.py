@@ -1,18 +1,20 @@
 """
-ReserveCalifornia checker — Playwright-based.
+ReserveCalifornia checker — curl_cffi TLS impersonation.
 
-The old calirdr.usedirect.com API is decommissioned. The current
-reservecalifornia.com site is Cloudflare-protected. We use a headless
-Chromium browser that passes the JS challenge, then intercepts ALL
-JSON XHR/fetch responses to find availability payloads.
+Cloudflare Bot Management blocks headless Playwright browsers (empty page,
+0 XHR captured on GitHub Actions). curl_cffi impersonates Chrome's TLS
+fingerprint at the network level, which bypasses Cloudflare's bot detection
+without requiring JS execution.
 
-Set env var CAMPING_DEBUG=1 to log every XHR URL captured.
+Availability endpoint discovered from the reservecalifornia.com AngularJS app:
+  GET /CaliforniaWebHome/Facilities/SearchViewUnitAvailabity.aspx
+      ?facility_id=677&start_date=05/16/2025&nights=2&...
+
+Set CAMPING_DEBUG=1 to log HTTP status codes and response previews.
 """
 
-import json
 import logging
 import os
-import time
 from datetime import date, timedelta
 
 from ..campgrounds import Campground, HookupType
@@ -22,9 +24,14 @@ from .base import friday_saturday_pairs
 
 log = logging.getLogger(__name__)
 DEBUG = os.getenv("CAMPING_DEBUG", "").lower() in ("1", "true", "yes")
-_EXECUTABLE = os.getenv("PLAYWRIGHT_EXECUTABLE_PATH") or None
 
-_BASE_URL = "https://www.reservecalifornia.com/Web/#!park/{park_id}"
+_BASE = "https://www.reservecalifornia.com"
+
+# Candidate availability endpoints, tried in order.
+_AVAIL_ENDPOINTS = [
+    f"{_BASE}/CaliforniaWebHome/Facilities/SearchViewUnitAvailabity.aspx",
+    f"{_BASE}/CaliforniaWebHome/Facilities/AdvanceSearchResults.aspx",
+]
 
 _HOOKUP_KEYWORDS: dict[str, HookupType] = {
     "full hookup": HookupType.FULL,
@@ -46,7 +53,6 @@ def _infer_hookup(text: str) -> HookupType:
 
 
 def _looks_like_availability(body: dict) -> bool:
-    """Return True if JSON body looks like an availability payload."""
     return (
         "Facility" in body
         or "Units" in body
@@ -113,161 +119,69 @@ def _parse_payload(payload: dict, campground: Campground,
 
 
 def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> list[AvailableSlot]:
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    from curl_cffi import requests as curl_req
 
+    session = curl_req.Session(impersonate="chrome124")
     results: list[AvailableSlot] = []
+    park_url = f"{_BASE}/Web/#!park/{campground.platform_id}"
 
-    with sync_playwright() as p:
-        launch_kwargs: dict = dict(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled",
-                  "--ignore-certificate-errors"],
-        )
-        if _EXECUTABLE:
-            launch_kwargs["executable_path"] = _EXECUTABLE
-        browser = p.chromium.launch(**launch_kwargs)
-        ctx = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            viewport={"width": 1280, "height": 900},
-            ignore_https_errors=True,
-        )
-        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-        page = ctx.new_page()
-
-        # ── Capture ALL JSON XHR/fetch responses ──────────────────────────────
-        # We log every URL in debug mode so we can discover the right patterns.
-        all_payloads: list[tuple[str, dict]] = []   # (url, body)
-
-        def _capture(response):
-            ct = response.headers.get("content-type", "")
-            if "json" not in ct:
-                return
-            if DEBUG:
-                log.info("[DEBUG] XHR: %s  %s", response.status, response.url[:120])
-            try:
-                body = response.json()
-                if isinstance(body, dict):
-                    all_payloads.append((response.url, body))
-            except Exception:
-                pass
-
-        page.on("response", _capture)
-
-        url = _BASE_URL.format(park_id=campground.platform_id)
-        log.debug("Loading %s", url)
-        try:
-            page.goto(url, wait_until="networkidle", timeout=45_000)
-        except PWTimeout:
-            log.warning("Timeout loading park page for %s", campground.name)
-
+    # Load the park page first to establish Cloudflare clearance cookies.
+    try:
+        r = session.get(park_url, timeout=25)
         if DEBUG:
-            log.info("[DEBUG] Page title: %r", page.title())
-            log.info("[DEBUG] Page URL: %s", page.url)
-            # Save screenshot so we can see what Cloudflare/the site actually renders
+            log.info("[DEBUG ReserveCA] base page %s -> HTTP %s", campground.platform_id, r.status_code)
+    except Exception as exc:
+        log.warning("ReserveCalifornia base page failed for %s: %s", campground.name, exc)
+
+    api_headers = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": park_url,
+        "Origin": _BASE,
+    }
+
+    for friday, sunday in pairs:
+        checkin_str = friday.strftime("%m/%d/%Y")
+        found_for_pair = False
+
+        for endpoint in _AVAIL_ENDPOINTS:
+            if found_for_pair:
+                break
+            params = {
+                "facility_id": campground.platform_id,
+                "start_date": checkin_str,
+                "nights": 2,
+                "unit_type_id": 0,
+                "web_only": "true",
+                "is_ada": "false",
+                "in_season_only": "true",
+            }
             try:
-                shot_path = f"/tmp/reserveca_debug_{campground.platform_id}.png"
-                page.screenshot(path=shot_path, full_page=False)
-                log.info("[DEBUG] Screenshot saved: %s", shot_path)
-            except Exception as ex:
-                log.info("[DEBUG] Screenshot failed: %s", ex)
-            # Log first 500 chars of page content
-            try:
-                content_preview = page.content()[:500].replace("\n", " ")
-                log.info("[DEBUG] Page content preview: %s", content_preview)
-            except Exception:
-                pass
-
-        time.sleep(2)
-
-        # ── Try to trigger a date search for each Fri+Sat pair ────────────────
-        for friday, sunday in pairs:
-            checkin_str = friday.strftime("%m/%d/%Y")
-            pair_payloads: list[dict] = []
-            snap = len(all_payloads)
-
-            # Try filling arrival date with several selector patterns
-            for sel in [
-                "input[placeholder*='rrival']",
-                "input[placeholder*='heck-in']",
-                "input[placeholder*='tart']",
-                "input[ng-model*='arrival']",
-                "input[ng-model*='Arrival']",
-                "input[ng-model*='ArrivalDate']",
-                "#ArrivalDate",
-                "input[id*='arrival' i]",
-                "input[type='date']",
-                "input[type='text']:first-of-type",
-            ]:
-                try:
-                    loc = page.locator(sel).first
-                    if loc.is_visible(timeout=1_500):
-                        loc.triple_click()
-                        loc.fill(checkin_str)
-                        loc.press("Tab")
-                        if DEBUG:
-                            log.info("[DEBUG] Filled arrival with selector: %s", sel)
-                        break
-                except Exception:
+                resp = session.get(endpoint, params=params, headers=api_headers, timeout=25)
+                if DEBUG:
+                    log.info("[DEBUG ReserveCA] %s %s -> HTTP %s",
+                             campground.platform_id, friday, resp.status_code)
+                if resp.status_code != 200:
+                    if DEBUG:
+                        log.info("[DEBUG ReserveCA] body preview: %s", resp.text[:300])
                     continue
+                body = resp.json()
+                if _looks_like_availability(body):
+                    slots = _parse_payload(body, campground, friday, sunday)
+                    results.extend(slots)
+                    found_for_pair = True
+                    if DEBUG:
+                        log.info("[DEBUG ReserveCA] %s %s: %d slots parsed from %s",
+                                 campground.platform_id, friday, len(slots), endpoint)
+                elif DEBUG:
+                    log.info("[DEBUG ReserveCA] response not availability shape: %s",
+                             str(body)[:200])
+            except Exception as exc:
+                log.debug("ReserveCalifornia endpoint %s failed for %s: %s",
+                          endpoint, campground.name, exc)
 
-            # Try clicking Search / Check Availability
-            for sel in [
-                "button:has-text('Search')",
-                "button:has-text('Check Availability')",
-                "button:has-text('Find')",
-                "[ng-click*='search' i]",
-                "[ng-click*='Search']",
-                "input[type='submit']",
-            ]:
-                try:
-                    btn = page.locator(sel).first
-                    if btn.is_visible(timeout=1_500):
-                        btn.click()
-                        if DEBUG:
-                            log.info("[DEBUG] Clicked: %s", sel)
-                        break
-                except Exception:
-                    continue
-
-            # Wait for new XHR to settle
-            try:
-                page.wait_for_load_state("networkidle", timeout=12_000)
-            except PWTimeout:
-                pass
-            time.sleep(2)
-
-            # Collect new payloads captured since the snap
-            new_payloads = [body for _, body in all_payloads[snap:]]
-            avail_payloads = [b for b in new_payloads if _looks_like_availability(b)]
-
-            if DEBUG:
-                log.info("[DEBUG] %s %s: %d new XHR, %d look like availability",
-                         campground.name, friday, len(new_payloads), len(avail_payloads))
-
-            for payload in avail_payloads:
-                results.extend(_parse_payload(payload, campground, friday, sunday))
-
-            time.sleep(1)
-
-        # ── Also try parsing any availability payload captured on initial load ─
-        initial_avail = [b for _, b in all_payloads if _looks_like_availability(b)]
-        if DEBUG:
-            log.info("[DEBUG] Total XHR captured: %d  Availability-like: %d",
-                     len(all_payloads), len(initial_avail))
-        for payload in initial_avail:
-            for friday, sunday in pairs:
-                slots = _parse_payload(payload, campground, friday, sunday)
-                results.extend(slots)
-
-        ctx.close()
-        browser.close()
-
-    # Deduplicate by slot_id
+    # Deduplicate
     seen: set[str] = set()
     unique: list[AvailableSlot] = []
     for s in results:
@@ -286,5 +200,5 @@ def check(campground: Campground, cfg: Config) -> list[AvailableSlot]:
         log.info("ReserveCalifornia %s: %d total slots found", campground.name, len(results))
         return results
     except Exception as exc:
-        log.error("ReserveCalifornia Playwright failed for %s: %s", campground.name, exc)
+        log.error("ReserveCalifornia curl_cffi failed for %s: %s", campground.name, exc)
         return []

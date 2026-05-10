@@ -19,6 +19,10 @@ on:
         description: 'Log every XHR URL captured from each site (helps diagnose 0-slot issues)'
         type: boolean
         default: false
+      heartbeat_mode:
+        description: 'Send weekly status email only (no scan)'
+        type: boolean
+        default: false
 
 jobs:
   check:
@@ -64,6 +68,9 @@ jobs:
           if [ "${{ inputs.test_mode }}" = "true" ]; then
             echo "Running in TEST MODE — sending test email only, no scan"
             python -m camping_alert.main --test
+          elif [ "${{ inputs.heartbeat_mode }}" = "true" ]; then
+            echo "Running heartbeat email"
+            python -m camping_alert.main --heartbeat
           else
             python -m camping_alert.main --once
           fi

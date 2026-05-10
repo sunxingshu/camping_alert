@@ -134,6 +134,65 @@ disappears and reappears.
     return msg
 
 
+def send_heartbeat(cfg: Config, campground_names: list[str], lookahead_weeks: int) -> None:
+    """Send a weekly 'system alive' status email."""
+    detected = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    cg_list = "\n".join(f"  • {n}" for n in campground_names)
+    cg_list_html = "".join(f"<li>{n}</li>" for n in campground_names)
+
+    subject = f"[Camping Alert] Weekly status — system is running ({detected[:10]})"
+
+    plain = f"""
+Camping Alert — Weekly Status
+==============================
+
+Your coastal campsite monitor is running normally.
+
+Monitoring {len(campground_names)} campgrounds ({lookahead_weeks} week lookahead):
+{cg_list}
+
+You will only receive emails when a site matching your filters opens up
+(hookup, dump station, 25ft+ pull-through, ocean adjacent).
+
+Status sent at: {detected}
+""".strip()
+
+    html = f"""
+<html><body style="font-family:Arial,sans-serif;max-width:560px;margin:auto">
+<div style="background:#1a6b3c;color:white;padding:14px;border-radius:8px 8px 0 0">
+  <h2 style="margin:0">Camping Alert — Weekly Status</h2>
+</div>
+<div style="border:1px solid #ccc;border-top:none;padding:16px;border-radius:0 0 8px 8px">
+  <p>Your coastal campsite monitor is <b>running normally</b>.</p>
+  <p>Monitoring <b>{len(campground_names)} campgrounds</b> with a {lookahead_weeks}-week lookahead:</p>
+  <ul>{cg_list_html}</ul>
+  <p style="color:#555">You will only receive emails when a site matching your filters opens up
+  (hookup + dump station + 25 ft+ pull-through + ocean adjacent).</p>
+  <p style="color:#999;font-size:12px;border-top:1px solid #eee;padding-top:8px;margin-top:16px">
+    Sent at {detected}
+  </p>
+</div>
+</body></html>
+""".strip()
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = cfg.alert_from_email
+    msg["To"] = cfg.alert_to_email
+    msg.attach(MIMEText(plain, "plain"))
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(cfg.alert_from_email, cfg.alert_from_password)
+            server.sendmail(cfg.alert_from_email, cfg.alert_to_email, msg.as_string())
+        log.info("Heartbeat email sent.")
+    except Exception as exc:
+        log.error("Failed to send heartbeat: %s", exc)
+
+
 def send_alert(slot: AvailableSlot, cfg: Config) -> None:
     msg = _build_email(slot, cfg)
     try:
