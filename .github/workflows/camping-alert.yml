@@ -15,6 +15,10 @@ on:
         description: 'Send a test email to verify credentials and pipeline (no real scan)'
         type: boolean
         default: false
+      debug_mode:
+        description: 'Log every XHR URL captured from each site (helps diagnose 0-slot issues)'
+        type: boolean
+        default: false
 
 jobs:
   check:
@@ -55,6 +59,7 @@ jobs:
           MIN_SITE_LENGTH_FT: "25"
           REQUIRE_HOOKUP: "true"
           REQUIRE_DUMP_STATION: "true"
+          CAMPING_DEBUG: ${{ inputs.debug_mode == true && '1' || '0' }}
         run: |
           if [ "${{ inputs.test_mode }}" = "true" ]; then
             echo "Running in TEST MODE — sending test email only, no scan"

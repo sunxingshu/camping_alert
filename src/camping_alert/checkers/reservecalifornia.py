@@ -2,16 +2,16 @@
 ReserveCalifornia checker — Playwright-based.
 
 The old calirdr.usedirect.com API is decommissioned. The current
-reservecalifornia.com site is behind Cloudflare, blocking plain HTTP.
-We use a headless Chromium browser that:
-  1. Navigates to the park's availability page (passes JS challenge).
-  2. Fills in the check-in date + 2 nights in the search form.
-  3. Waits for the calendar XHR to fire and intercepts the JSON payload.
-  4. Parses the payload for per-unit availability.
+reservecalifornia.com site is Cloudflare-protected. We use a headless
+Chromium browser that passes the JS challenge, then intercepts ALL
+JSON XHR/fetch responses to find availability payloads.
+
+Set env var CAMPING_DEBUG=1 to log every XHR URL captured.
 """
 
 import json
 import logging
+import os
 import time
 from datetime import date, timedelta
 
@@ -21,14 +21,9 @@ from ..matcher import AvailableSlot
 from .base import friday_saturday_pairs
 
 log = logging.getLogger(__name__)
+DEBUG = os.getenv("CAMPING_DEBUG", "").lower() in ("1", "true", "yes")
 
 _BASE_URL = "https://www.reservecalifornia.com/Web/#!park/{park_id}"
-
-# URL fragments that identify the availability XHR payload
-_XHR_PATTERNS = (
-    "grid", "availability", "UnitAvail", "unitavail",
-    "SearchViewUnit", "Availab",
-)
 
 _HOOKUP_KEYWORDS: dict[str, HookupType] = {
     "full hookup": HookupType.FULL,
@@ -49,6 +44,17 @@ def _infer_hookup(text: str) -> HookupType:
     return HookupType.NONE
 
 
+def _looks_like_availability(body: dict) -> bool:
+    """Return True if JSON body looks like an availability payload."""
+    return (
+        "Facility" in body
+        or "Units" in body
+        or "units" in body
+        or "availability" in str(body)[:200].lower()
+        or "Slices" in str(body)[:200]
+    )
+
+
 def _parse_payload(payload: dict, campground: Campground,
                    friday: date, sunday: date) -> list[AvailableSlot]:
     results: list[AvailableSlot] = []
@@ -57,7 +63,7 @@ def _parse_payload(payload: dict, campground: Campground,
     sat_str = saturday.strftime("%-m/%-d/%Y")
 
     facility = payload.get("Facility") or {}
-    units: dict = facility.get("Units") or {}
+    units: dict = facility.get("Units") or payload.get("Units") or {}
 
     for unit_id, unit in units.items():
         slices: dict = unit.get("Slices") or {}
@@ -72,12 +78,12 @@ def _parse_payload(payload: dict, campground: Campground,
         unit_type = unit.get("UnitTypeName") or ""
         hookup = _infer_hookup(unit_type)
         length: int | None = None
-        raw_len = unit.get("MaxLength") or unit.get("VehicleLength")
-        if raw_len:
-            try:
+        try:
+            raw_len = unit.get("MaxLength") or unit.get("VehicleLength")
+            if raw_len:
                 length = int(raw_len)
-            except (TypeError, ValueError):
-                pass
+        except (TypeError, ValueError):
+            pass
 
         site_name = unit.get("Name") or str(unit_id)
         is_pull: bool | None = (
@@ -105,14 +111,7 @@ def _parse_payload(payload: dict, campground: Campground,
     return results
 
 
-def _check_one_park_all_dates(
-    campground: Campground,
-    pairs: list[tuple[date, date]],
-) -> list[AvailableSlot]:
-    """
-    Open the park page once, fill in each Fri+Sat pair, capture the XHR.
-    Reuses the same browser session to avoid re-loading/re-challenging Cloudflare.
-    """
+def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> list[AvailableSlot]:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
     results: list[AvailableSlot] = []
@@ -130,124 +129,137 @@ def _check_one_park_all_dates(
         )
         page = ctx.new_page()
 
-        # Initial park page load
+        # ── Capture ALL JSON XHR/fetch responses ──────────────────────────────
+        # We log every URL in debug mode so we can discover the right patterns.
+        all_payloads: list[tuple[str, dict]] = []   # (url, body)
+
+        def _capture(response):
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            if DEBUG:
+                log.info("[DEBUG] XHR: %s  %s", response.status, response.url[:120])
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    all_payloads.append((response.url, body))
+            except Exception:
+                pass
+
+        page.on("response", _capture)
+
         url = _BASE_URL.format(park_id=campground.platform_id)
         log.debug("Loading %s", url)
         try:
             page.goto(url, wait_until="networkidle", timeout=45_000)
         except PWTimeout:
-            log.warning("Timeout loading %s — continuing anyway", url)
+            log.warning("Timeout loading park page for %s", campground.name)
+
+        if DEBUG:
+            log.info("[DEBUG] Page title: %s", page.title())
+            log.info("[DEBUG] Page URL: %s", page.url)
+
         time.sleep(2)
 
+        # ── Try to trigger a date search for each Fri+Sat pair ────────────────
         for friday, sunday in pairs:
-            saturday = friday + timedelta(days=1)
-            captured: list[dict] = []
+            checkin_str = friday.strftime("%m/%d/%Y")
+            pair_payloads: list[dict] = []
+            snap = len(all_payloads)
 
-            def _capture(response):
-                url_r = response.url
-                if any(p in url_r for p in _XHR_PATTERNS):
-                    try:
-                        body = response.json()
-                        if isinstance(body, dict) and "Facility" in body:
-                            captured.append(body)
-                    except Exception:
-                        pass
-
-            page.on("response", _capture)
-
-            # Try filling the arrival date — attempt several selector patterns
-            checkin_str = friday.strftime("%m/%d/%Y")  # MM/DD/YYYY format
-            filled = False
+            # Try filling arrival date with several selector patterns
             for sel in [
-                "input[placeholder*='rrival']",      # Arrival date
-                "input[placeholder*='heck']",         # Check-in
-                "input[placeholder*='tart']",         # Start date
+                "input[placeholder*='rrival']",
+                "input[placeholder*='heck-in']",
+                "input[placeholder*='tart']",
                 "input[ng-model*='arrival']",
+                "input[ng-model*='Arrival']",
                 "input[ng-model*='ArrivalDate']",
-                "input[id*='arrival']",
-                "input[id*='Arrival']",
                 "#ArrivalDate",
-            ]:
-                try:
-                    loc = page.locator(sel).first
-                    if loc.is_visible(timeout=2_000):
-                        loc.triple_click()
-                        loc.fill(checkin_str)
-                        loc.press("Tab")
-                        filled = True
-                        log.debug("Filled arrival via selector: %s", sel)
-                        break
-                except Exception:
-                    continue
-
-            if not filled:
-                log.debug("Could not find arrival date input for %s", campground.name)
-
-            # Set nights to 2 if possible
-            for sel in [
-                "select[ng-model*='nights']",
-                "select[ng-model*='Nights']",
-                "input[ng-model*='nights']",
-                "#Nights", "#nights",
+                "input[id*='arrival' i]",
+                "input[type='date']",
+                "input[type='text']:first-of-type",
             ]:
                 try:
                     loc = page.locator(sel).first
                     if loc.is_visible(timeout=1_500):
-                        loc.select_option("2") if loc.evaluate("e => e.tagName") == "SELECT" else loc.fill("2")
+                        loc.triple_click()
+                        loc.fill(checkin_str)
+                        loc.press("Tab")
+                        if DEBUG:
+                            log.info("[DEBUG] Filled arrival with selector: %s", sel)
                         break
                 except Exception:
                     continue
 
-            # Click search / check availability button
+            # Try clicking Search / Check Availability
             for sel in [
                 "button:has-text('Search')",
                 "button:has-text('Check Availability')",
                 "button:has-text('Find')",
+                "[ng-click*='search' i]",
+                "[ng-click*='Search']",
                 "input[type='submit']",
-                "a:has-text('Search')",
             ]:
                 try:
                     btn = page.locator(sel).first
                     if btn.is_visible(timeout=1_500):
                         btn.click()
-                        log.debug("Clicked search button: %s", sel)
+                        if DEBUG:
+                            log.info("[DEBUG] Clicked: %s", sel)
                         break
                 except Exception:
                     continue
 
-            # Wait for XHR to settle
+            # Wait for new XHR to settle
             try:
-                page.wait_for_load_state("networkidle", timeout=15_000)
+                page.wait_for_load_state("networkidle", timeout=12_000)
             except PWTimeout:
                 pass
             time.sleep(2)
 
-            page.remove_listener("response", _capture)
+            # Collect new payloads captured since the snap
+            new_payloads = [body for _, body in all_payloads[snap:]]
+            avail_payloads = [b for b in new_payloads if _looks_like_availability(b)]
 
-            if captured:
-                log.debug("Captured %d XHR payload(s) for %s %s",
-                          len(captured), campground.name, friday)
-                for payload in captured:
-                    results.extend(_parse_payload(payload, campground, friday, sunday))
-            else:
-                log.debug("No availability XHR captured for %s %s — site may be fully booked",
-                          campground.name, friday)
+            if DEBUG:
+                log.info("[DEBUG] %s %s: %d new XHR, %d look like availability",
+                         campground.name, friday, len(new_payloads), len(avail_payloads))
 
-            time.sleep(2)  # polite gap between searches
+            for payload in avail_payloads:
+                results.extend(_parse_payload(payload, campground, friday, sunday))
+
+            time.sleep(1)
+
+        # ── Also try parsing any availability payload captured on initial load ─
+        initial_avail = [b for _, b in all_payloads if _looks_like_availability(b)]
+        if DEBUG:
+            log.info("[DEBUG] Total XHR captured: %d  Availability-like: %d",
+                     len(all_payloads), len(initial_avail))
+        for payload in initial_avail:
+            for friday, sunday in pairs:
+                slots = _parse_payload(payload, campground, friday, sunday)
+                results.extend(slots)
 
         ctx.close()
         browser.close()
 
-    return results
+    # Deduplicate by slot_id
+    seen: set[str] = set()
+    unique: list[AvailableSlot] = []
+    for s in results:
+        if s.slot_id not in seen:
+            seen.add(s.slot_id)
+            unique.append(s)
+    return unique
 
 
 def check(campground: Campground, cfg: Config) -> list[AvailableSlot]:
     pairs = friday_saturday_pairs(cfg.lookahead_weeks_min, cfg.lookahead_weeks_max)
     if not pairs:
         return []
-
     try:
-        results = _check_one_park_all_dates(campground, pairs)
+        results = _check_one_park(campground, pairs)
         log.info("ReserveCalifornia %s: %d total slots found", campground.name, len(results))
         return results
     except Exception as exc:
