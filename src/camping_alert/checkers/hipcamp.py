@@ -7,6 +7,10 @@ XHR debug revealed two working endpoints:
 
 We intercept these in a headless browser that passes Cloudflare's
 JS challenge, then parse listings for ocean-adjacent hookup sites.
+
+Set CAMPING_DEBUG=1 to log every XHR URL and the structure of each
+payload, which is essential for diagnosing 0-slot issues when Hipcamp
+changes their response shape.
 """
 
 import logging
@@ -80,22 +84,37 @@ def _extract_length(text: str) -> int | None:
 
 
 def _listing_text(listing: dict) -> str:
+    amenities = listing.get("amenities") or []
+    tags = listing.get("tags") or []
+    # amenities/tags may be list of strings or list of dicts with a "name" key
+    def _flatten(items) -> str:
+        parts = []
+        for item in items:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(item.get("name") or item.get("label") or "")
+        return " ".join(filter(None, parts))
+
     return " ".join(filter(None, [
         listing.get("name") or "",
         listing.get("description") or "",
-        " ".join(listing.get("amenities") or []),
-        " ".join(listing.get("tags") or []),
+        listing.get("summary") or "",
+        _flatten(amenities),
+        _flatten(tags),
         listing.get("city") or "",
+        listing.get("state") or "",
+        listing.get("location_name") or "",
     ]))
 
 
 def _make_stub(listing: dict) -> Campground:
-    pid = str(listing.get("id") or listing.get("listing_id") or "unknown")
-    slug = listing.get("slug") or listing.get("url_slug") or pid
+    pid = str(listing.get("id") or listing.get("listing_id") or listing.get("listingId") or "unknown")
+    slug = listing.get("slug") or listing.get("url_slug") or listing.get("urlSlug") or pid
     text = _listing_text(listing)
     return Campground(
         name=listing.get("name") or "Hipcamp site",
-        park_name=listing.get("property_name") or listing.get("name") or "Hipcamp",
+        park_name=listing.get("property_name") or listing.get("propertyName") or listing.get("name") or "Hipcamp",
         city=listing.get("city") or "CA",
         platform=Platform.HIPCAMP,
         platform_id=pid,
@@ -134,31 +153,103 @@ def _slot_from_listing(listing: dict, friday: date, sunday: date) -> AvailableSl
     )
 
 
-def _extract_listings(payload: dict) -> list[dict]:
-    """Pull a flat list of listing dicts from any known Hipcamp response shape."""
-    # Use `or {}` so that explicitly-null keys don't crash the chained .get()
+def _find_listing_arrays(obj, depth: int = 0) -> list[list[dict]]:
+    """
+    Recursively walk a JSON object and return every list-of-dicts that looks
+    like it could contain campsite listings (has 'id' or 'name' fields).
+    Stops at depth 6 to avoid runaway traversal.
+    """
+    found = []
+    if depth > 6:
+        return found
+    if isinstance(obj, list) and obj:
+        if isinstance(obj[0], dict) and ("id" in obj[0] or "name" in obj[0] or "listingId" in obj[0]):
+            found.append(obj)
+        for item in obj:
+            found.extend(_find_listing_arrays(item, depth + 1))
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            found.extend(_find_listing_arrays(v, depth + 1))
+    return found
+
+
+def _log_payload_structure(payload: dict, url: str) -> None:
+    """Log 2 levels of the payload structure to diagnose extraction failures."""
+    def _summarize(val) -> str:
+        if isinstance(val, dict):
+            return f"dict keys={list(val.keys())[:8]}"
+        if isinstance(val, list):
+            first_type = type(val[0]).__name__ if val else "empty"
+            sample_keys = list(val[0].keys())[:6] if val and isinstance(val[0], dict) else ""
+            return f"list[{len(val)}] of {first_type} {sample_keys}"
+        return f"{type(val).__name__}={repr(val)[:60]}"
+
+    log.info("[DEBUG Hipcamp] Payload from %s", url[-100:])
+    for k, v in payload.items():
+        log.info("[DEBUG Hipcamp]   %-20s %s", k, _summarize(v))
+        if isinstance(v, dict):
+            for k2, v2 in list(v.items())[:10]:
+                log.info("[DEBUG Hipcamp]     %-18s %s", k2, _summarize(v2))
+
+
+def _extract_listings(payload: dict, url: str = "") -> list[dict]:
+    """
+    Pull a flat list of listing dicts from any Hipcamp response shape.
+    First tries known key paths; falls back to recursive scan of the whole
+    payload for any list-of-dicts that looks like campsite listings.
+    """
     page_props = payload.get("pageProps") or {}
     data_block = payload.get("data") or {}
     search_data = page_props.get("searchData") or {}
+
+    # Known key paths (expand as we discover new shapes via debug logs)
     candidates = [
-        # Next.js _next/data shape
+        # Next.js _next/data shapes
         page_props.get("initialListings"),
         page_props.get("listings"),
         page_props.get("searchResults"),
+        page_props.get("campsiteListings"),
         search_data.get("listings"),
-        # Direct REST shape
+        search_data.get("results"),
+        # Direct REST
         payload.get("campsite_listings"),
         payload.get("listings"),
         payload.get("results"),
-        # GraphQL shape
+        # GraphQL top-level data fields
         data_block.get("listings"),
         data_block.get("searchListings"),
         data_block.get("campsiteListings"),
+        # GraphQL nested under a query name
+        *(v.get("listings") for v in data_block.values() if isinstance(v, dict)),
+        *(v.get("results") for v in data_block.values() if isinstance(v, dict)),
+        *(v.get("campsites") for v in data_block.values() if isinstance(v, dict)),
     ]
+
     for lst in candidates:
         if isinstance(lst, list) and lst:
-            # Filter out any null/non-dict items that sneak in
-            return [item for item in lst if isinstance(item, dict)]
+            clean = [item for item in lst if isinstance(item, dict)]
+            if clean:
+                if DEBUG:
+                    log.info("[DEBUG Hipcamp] ✓ found %d listings via known key path (url=%s)",
+                             len(clean), url[-80:])
+                return clean
+
+    # Fallback: recursive scan
+    arrays = _find_listing_arrays(payload)
+    if arrays:
+        # Pick the largest array (most likely to be the search results)
+        best = max(arrays, key=len)
+        clean = [item for item in best if isinstance(item, dict)]
+        if clean:
+            if DEBUG:
+                log.info("[DEBUG Hipcamp] ✓ found %d listings via recursive scan (url=%s)",
+                         len(clean), url[-80:])
+            return clean
+
+    if DEBUG:
+        log.info("[DEBUG Hipcamp] ✗ no listings found in payload (url=%s)", url[-80:])
+        _log_payload_structure(payload, url)
+
     return []
 
 
@@ -194,14 +285,13 @@ def check_hipcamp(cfg: Config) -> list[AvailableSlot]:
         for friday, sunday in pairs:
             checkin_str = friday.isoformat()
             url = _SEARCH_URL.format(checkin=checkin_str)
-            captured_payloads: list[dict] = []
+            captured: list[tuple[str, dict]] = []  # (url, body)
 
             def _on_response(response):
                 ru = response.url
                 ct = response.headers.get("content-type", "")
                 if "json" not in ct:
                     return
-                # Only capture Hipcamp's own data endpoints
                 if "hipcamp.com" not in ru and "api.hipcamp" not in ru:
                     return
                 if DEBUG:
@@ -209,7 +299,7 @@ def check_hipcamp(cfg: Config) -> list[AvailableSlot]:
                 try:
                     body = response.json()
                     if isinstance(body, dict):
-                        captured_payloads.append(body)
+                        captured.append((ru, body))
                 except Exception:
                     pass
 
@@ -217,7 +307,6 @@ def check_hipcamp(cfg: Config) -> list[AvailableSlot]:
 
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=35_000)
-                # Give JS time to fire the data fetches
                 page.wait_for_load_state("networkidle", timeout=15_000)
             except PWTimeout:
                 log.debug("Hipcamp page load partial timeout for %s — continuing", friday)
@@ -226,10 +315,10 @@ def check_hipcamp(cfg: Config) -> list[AvailableSlot]:
             page.remove_listener("response", _on_response)
 
             if DEBUG:
-                log.info("[DEBUG Hipcamp] %s: captured %d payloads", friday, len(captured_payloads))
+                log.info("[DEBUG Hipcamp] %s: captured %d payloads", friday, len(captured))
 
-            for payload in captured_payloads:
-                for listing in _extract_listings(payload):
+            for payload_url, payload in captured:
+                for listing in _extract_listings(payload, payload_url):
                     slot = _slot_from_listing(listing, friday, sunday)
                     if slot and slot.slot_id not in seen_ids:
                         seen_ids.add(slot.slot_id)

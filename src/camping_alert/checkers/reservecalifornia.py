@@ -137,6 +137,8 @@ def _discover_api_base(session) -> str | None:
     # Scan main page HTML for inline config / API URL hints
     try:
         r = session.get(_BASE + "/", timeout=20)
+        if DEBUG:
+            log.info("[DEBUG ReserveCA] root page -> HTTP %s (len %d)", r.status_code, len(r.text))
         if r.status_code == 200:
             for pattern in (
                 r'(?:apiUrl|apiBaseUrl|baseUrl|serviceUrl)\s*[=:]\s*["\']([^"\']{10,120})["\']',
@@ -183,14 +185,24 @@ def _check_one_park(campground: Campground, pairs: list[tuple[date, date]]) -> l
     results: list[AvailableSlot] = []
     park_url = f"{_BASE}/Web/#!park/{campground.platform_id}"
 
-    # Load the park page to establish Cloudflare clearance cookies.
-    try:
-        r = session.get(park_url, timeout=25)
-        if DEBUG:
-            log.info("[DEBUG ReserveCA] park page %s -> HTTP %s (len %d)",
-                     campground.platform_id, r.status_code, len(r.text))
-    except Exception as exc:
-        log.warning("ReserveCalifornia base page failed for %s: %s", campground.name, exc)
+    # Try several park page URLs — site moved from /Web/#!park/{id} to root
+    for candidate_url in [
+        park_url,
+        f"{_BASE}/#!park/{campground.platform_id}",
+        f"{_BASE}/",
+        _BASE,
+    ]:
+        try:
+            r = session.get(candidate_url, timeout=25)
+            if DEBUG:
+                log.info("[DEBUG ReserveCA] park page %s -> HTTP %s (len %d) url=%s",
+                         campground.platform_id, r.status_code, len(r.text), candidate_url)
+            if r.status_code == 200:
+                park_url = candidate_url
+                break
+        except Exception as exc:
+            log.warning("ReserveCalifornia base page failed for %s at %s: %s",
+                        campground.name, candidate_url, exc)
 
     # Try to learn the real API base URL from SPA config/HTML
     api_base = _discover_api_base(session)
