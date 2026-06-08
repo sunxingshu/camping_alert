@@ -140,7 +140,7 @@ def send_heartbeat(cfg: Config, campground_names: list[str], lookahead_weeks: in
     cg_list = "\n".join(f"  • {n}" for n in campground_names)
     cg_list_html = "".join(f"<li>{n}</li>" for n in campground_names)
 
-    subject = f"[Camping Alert] Weekly status — system is running ({detected[:10]})"
+    subject = f"[Camping Alert] Weekly status — running, nothing to report ({detected[:10]})"
 
     plain = f"""
 Camping Alert — Weekly Status
@@ -148,11 +148,15 @@ Camping Alert — Weekly Status
 
 Your coastal campsite monitor is running normally.
 
+Nothing new is being reported in this weekly status email. Daily scans will
+still email you immediately if a campsite matching your filters opens up.
+
 Monitoring {len(campground_names)} campgrounds ({lookahead_weeks} week lookahead):
 {cg_list}
 
-You will only receive emails when a site matching your filters opens up
-(hookup, dump station, 25ft+ pull-through, ocean adjacent).
+Outside this weekly status email, you will only receive emails when a site
+matching your filters opens up (hookup, dump station, 25ft+ pull-through,
+ocean adjacent).
 
 Status sent at: {detected}
 """.strip()
@@ -164,10 +168,13 @@ Status sent at: {detected}
 </div>
 <div style="border:1px solid #ccc;border-top:none;padding:16px;border-radius:0 0 8px 8px">
   <p>Your coastal campsite monitor is <b>running normally</b>.</p>
+  <p><b>Nothing new to report in this weekly status email.</b> Daily scans will
+  still email you immediately if a campsite matching your filters opens up.</p>
   <p>Monitoring <b>{len(campground_names)} campgrounds</b> with a {lookahead_weeks}-week lookahead:</p>
   <ul>{cg_list_html}</ul>
-  <p style="color:#555">You will only receive emails when a site matching your filters opens up
-  (hookup + dump station + 25 ft+ pull-through + ocean adjacent).</p>
+  <p style="color:#555">Outside this weekly status email, you will only receive emails
+  when a site matching your filters opens up (hookup + dump station + 25 ft+
+  pull-through + ocean adjacent).</p>
   <p style="color:#999;font-size:12px;border-top:1px solid #eee;padding-top:8px;margin-top:16px">
     Sent at {detected}
   </p>

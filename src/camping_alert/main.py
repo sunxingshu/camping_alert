@@ -100,32 +100,11 @@ def run_check(cfg, db: SlotDB) -> int:
     except Exception as exc:
         log.error("Hipcamp check failed: %s", exc)
 
-    # ── Weekly heartbeat on Sundays ────────────────────────────────────────────
-    import zoneinfo
-    now_pt = datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles"))
-    if now_pt.weekday() == 6:  # Sunday
-        _maybe_send_heartbeat(cfg, db)
-
     # ── Prune stale seen slots that are now in the past ────────────────────────
     _prune_past_slots(db)
 
     log.info("=== Check complete. %d new alerts sent. ===", new_alert_count)
     return new_alert_count
-
-
-def _maybe_send_heartbeat(cfg, db: SlotDB) -> None:
-    """Send heartbeat at most once per Sunday (keyed by ISO week in DB)."""
-    from datetime import date
-    from .campgrounds import CAMPGROUNDS
-    week_key = f"__heartbeat__{date.today().isocalendar().week}"
-    if db.is_new(week_key):
-        names = [f"{c.name} ({c.city})" for c in CAMPGROUNDS]
-        try:
-            send_heartbeat(cfg, names, cfg.lookahead_weeks_max)
-            db.mark_seen(week_key, "system", "heartbeat",
-                         date.today().isoformat(), date.today().isoformat(), "")
-        except Exception as exc:
-            log.error("Heartbeat failed: %s", exc)
 
 
 def _prune_past_slots(db: SlotDB) -> None:

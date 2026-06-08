@@ -2,8 +2,11 @@ name: Camping Availability Check
 
 on:
   schedule:
+    # Weekly status email: Sunday 8 AM Pacific.
+    - cron: '0 15 * * 0'
     # Every day: 8 AM, 1 PM, 7 PM Pacific (15, 20, 02 UTC)
-    - cron: '0 15,20 * * 0,1,2,3,6'   # Sun–Thu + Sat morning/afternoon
+    - cron: '0 20 * * 0,1,2,3,6'       # Sun–Thu + Sat afternoon
+    - cron: '0 15 * * 1,2,3,6'         # Mon–Wed + Sat morning
     - cron: '0 2 * * 1,2,3,4,0'        # Sun–Thu evening (02 UTC = prev-day 7 PM PT)
     # Friday: every 30 min — campgrounds release dates Thu night / Fri morning
     - cron: '0,30 13-23 * * 5'
@@ -68,8 +71,8 @@ jobs:
           if [ "${{ inputs.test_mode }}" = "true" ]; then
             echo "Running in TEST MODE — sending test email only, no scan"
             python -m camping_alert.main --test
-          elif [ "${{ inputs.heartbeat_mode }}" = "true" ]; then
-            echo "Running heartbeat email"
+          elif [ "${{ inputs.heartbeat_mode }}" = "true" ] || { [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "0 15 * * 0" ]; }; then
+            echo "Running weekly heartbeat email"
             python -m camping_alert.main --heartbeat
           else
             python -m camping_alert.main --once
